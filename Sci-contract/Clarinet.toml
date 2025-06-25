@@ -5,6 +5,11 @@ authors = []
 telemetry = true
 cache_dir = '.\.cache'
 requirements = []
+[contracts.IP-NFt]
+path = 'contracts/IP-NFt.clar'
+clarity_version = 3
+epoch = 3.0
+
 [contracts.decentralised-funding]
 path = 'contracts/decentralised-funding.clar'
 clarity_version = 3
