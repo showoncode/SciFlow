@@ -13,17 +13,20 @@
 (define-constant ERR_INVALID_METADATA (err u104))
 (define-constant ERR_ALREADY_MINTED (err u105))
 (define-constant ERR_TRANSFER_FAILED (err u106))
+(define-constant ERR_INVALID_TOKEN_ID (err u107))
+(define-constant ERR_APPROVAL_NOT_FOUND (err u108))
 
 ;; Data Variables
+;; Data Variables - Use string-ascii for consistency
 (define-data-var last-token-id uint u0)
 (define-data-var contract-uri (string-utf8 256) u"https://ipnft.research.org/metadata/")
 
-;; Maps
-;; Token ownership mapping
-(define-map token-owner uint principal)
+;; Define the NFT
+(define-non-fungible-token ip-nft uint)
 
-;; Token approval mapping (owner -> spender -> token-id -> approved)
-(define-map token-approvals {owner: principal, spender: principal, token-id: uint} bool)
+;; Maps
+;; Token approval mapping - FIXED: Simplified structure
+(define-map token-approvals uint principal)
 
 ;; Operator approval mapping (owner -> operator -> approved)
 (define-map operator-approvals {owner: principal, operator: principal} bool)
@@ -60,31 +63,72 @@
     (ok (var-get last-token-id))
 )
 
-;; Get token URI
+;; ;; Get token URI - FIXED: Better error handling with working uint conversion
+;; (define-read-only (get-token-uri (token-id uint))
+;;     (if (and (> token-id u0) (<= token-id (var-get last-token-id)))
+;;         (ok (some (concat (var-get contract-uri) (int-to-ascii (to-int token-id)))))
+;;         (ok none)
+;;     )
+;; )
+
+;; Get token URI - Clean implementation with matching types
 (define-read-only (get-token-uri (token-id uint))
-    (ok (some (concat (var-get contract-uri) (uint-to-ascii token-id))))
+    (if (and (> token-id u0) (<= token-id (var-get last-token-id)))
+        (ok (some (concat (var-get contract-uri) (int-to-utf8 (to-int token-id)))))
+        (ok none)
+    )
 )
 
-;; Get token owner
-(define-read-only (get-owner (token-id uint))
-    (ok (map-get? token-owner token-id))
-)
-
-;; Transfer function
-(define-public (transfer (token-id uint) (sender principal) (recipient principal))
-    (let ((owner (unwrap! (map-get? token-owner token-id) ERR_TOKEN_NOT_FOUND)))
-        (asserts! (or (is-eq tx-sender sender) (is-eq tx-sender owner)) ERR_NOT_AUTHORIZED)
-        (asserts! (is-eq owner sender) ERR_NOT_TOKEN_OWNER)
-        (map-set token-owner token-id recipient)
-        (map-delete token-approvals {owner: sender, spender: tx-sender, token-id: token-id})
-        (print {type: "transfer", token-id: token-id, sender: sender, recipient: recipient})
+;; Administrative function - Update to match string-ascii
+(define-public (set-contract-uri (new-uri (string-utf8 256)))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+        (var-set contract-uri new-uri)
         (ok true)
+    )
+)
+
+;; Get token owner - FIXED: Use built-in NFT function
+(define-read-only (get-owner (token-id uint))
+    (ok (nft-get-owner? ip-nft token-id))
+)
+
+;; Transfer function - FIXED: Inline approval check to avoid function order issues
+(define-public (transfer (token-id uint) (sender principal) (recipient principal))
+    (begin
+        ;; Validate token exists
+        (asserts! (and (> token-id u0) (<= token-id (var-get last-token-id))) ERR_INVALID_TOKEN_ID)
+        
+        ;; Check ownership and authorization
+        (asserts! (is-eq (some sender) (nft-get-owner? ip-nft token-id)) ERR_NOT_TOKEN_OWNER)
+        
+        ;; Check if tx-sender is authorized to transfer
+        (asserts! (or 
+            ;; Sender is the tx-sender (owner transferring their own token)
+            (is-eq tx-sender sender)
+            ;; tx-sender is approved for this specific token
+            (is-eq (some tx-sender) (map-get? token-approvals token-id))
+            ;; tx-sender is approved as operator for all tokens of this owner
+            (default-to false (map-get? operator-approvals {owner: sender, operator: tx-sender}))
+        ) ERR_NOT_AUTHORIZED)
+        
+        ;; Clear any existing approval for this token
+        (map-delete token-approvals token-id)
+        
+        ;; Transfer the NFT using built-in function
+        (match (nft-transfer? ip-nft token-id sender recipient)
+            success (begin
+                (print {type: "transfer", token-id: token-id, sender: sender, recipient: recipient})
+                (ok true)
+            )
+            error ERR_TRANSFER_FAILED
+        )
     )
 )
 
 ;; Core IP NFT Functions
 
-;; Mint new IP NFT
+;; Mint new IP NFT - FIXED: Inline author stats update
 (define-public (mint-ip-nft 
     (recipient principal)
     (title (string-utf8 256))
@@ -102,45 +146,102 @@
         (asserts! (is-eq (len abstract-hash) u64) ERR_INVALID_METADATA)
         (asserts! (is-none (map-get? hash-to-token abstract-hash)) ERR_ALREADY_MINTED)
         
-        ;; Set token ownership and metadata
-        (map-set token-owner token-id recipient)
-        (map-set hash-to-token abstract-hash token-id)
-        (map-set ip-metadata token-id {
-            title: title,
-            abstract-hash: abstract-hash,
-            doi: doi,
-            ip-type: ip-type,
-            timestamp: block-height,
-            author: tx-sender,
-            institution: institution,
-            keywords: keywords,
-            license-type: license-type,
-            peer-reviewed: peer-reviewed
-        })
-        
-        ;; Update author statistics
-        (update-author-stats tx-sender ip-type)
-        
-        ;; Update last token ID
-        (var-set last-token-id token-id)
-        
-        ;; Emit mint event
-        (print {
-            type: "mint",
-            token-id: token-id,
-            recipient: recipient,
-            author: tx-sender,
-            title: title,
-            ip-type: ip-type,
-            timestamp: block-height
-        })
-        
-        (ok token-id)
+        ;; Mint the NFT
+        (match (nft-mint? ip-nft token-id recipient)
+            success (begin
+                ;; Set metadata mappings
+                (map-set hash-to-token abstract-hash token-id)
+                (map-set ip-metadata token-id {
+                    title: title,
+                    abstract-hash: abstract-hash,
+                    doi: doi,
+                    ip-type: ip-type,
+                    timestamp: stacks-block-height,
+                    author: tx-sender,
+                    institution: institution,
+                    keywords: keywords,
+                    license-type: license-type,
+                    peer-reviewed: peer-reviewed
+                })
+                
+                ;; Update author statistics inline
+                (let ((current-stats (default-to {total-minted: u0, papers: u0, datasets: u0, theses: u0} 
+                                               (map-get? author-stats tx-sender))))
+                    (map-set author-stats tx-sender {
+                        total-minted: (+ (get total-minted current-stats) u1),
+                        papers: (+ (get papers current-stats) (if (is-eq ip-type "research-paper") u1 u0)),
+                        datasets: (+ (get datasets current-stats) (if (is-eq ip-type "dataset") u1 u0)),
+                        theses: (+ (get theses current-stats) (if (is-eq ip-type "thesis") u1 u0))
+                    })
+                )
+                
+                ;; Update last token ID
+                (var-set last-token-id token-id)
+                
+                ;; Emit mint event
+                (print {
+                    type: "mint",
+                    token-id: token-id,
+                    recipient: recipient,
+                    author: tx-sender,
+                    title: title,
+                    ip-type: ip-type,
+                    timestamp: stacks-block-height
+                })
+                
+                (ok token-id)
+            )
+            error ERR_TRANSFER_FAILED
+        )
     )
 )
 
-;; Batch mint multiple IP NFTs
-(define-public (batch-mint-ip-nfts 
+;; ;; Batch mint multiple IP NFTs - FIXED: Better error handling
+;; (define-public (batch-mint-ip-nfts 
+;;     (mint-requests (list 10 {
+;;         recipient: principal,
+;;         title: (string-utf8 256),
+;;         abstract-hash: (string-ascii 64),
+;;         doi: (optional (string-ascii 128)),
+;;         ip-type: (string-ascii 32),
+;;         institution: (optional (string-utf8 128)),
+;;         keywords: (list 10 (string-utf8 64)),
+;;         license-type: (string-ascii 64),
+;;         peer-reviewed: bool
+;;     }))
+;; )
+;;     (fold batch-mint-helper mint-requests (ok (list)))
+;; )
+
+;; Helper to process individual mint request
+(define-private (process-mint-request 
+    (request {
+        recipient: principal,
+        title: (string-utf8 256),
+        abstract-hash: (string-ascii 64),
+        doi: (optional (string-ascii 128)),
+        ip-type: (string-ascii 32),
+        institution: (optional (string-utf8 128)),
+        keywords: (list 10 (string-utf8 64)),
+        license-type: (string-ascii 64),
+        peer-reviewed: bool
+    })
+)
+    (mint-ip-nft 
+        (get recipient request)
+        (get title request)
+        (get abstract-hash request)
+        (get doi request)
+        (get ip-type request)
+        (get institution request)
+        (get keywords request)
+        (get license-type request)
+        (get peer-reviewed request)
+    )
+)
+
+;; Simplified batch mint - processes all requests and returns results
+(define-public (batch-mint-ip-nfts-simple
     (mint-requests (list 10 {
         recipient: principal,
         title: (string-utf8 256),
@@ -153,10 +254,14 @@
         peer-reviewed: bool
     }))
 )
-    (fold batch-mint-helper mint-requests (ok (list)))
+    (let ((results (map process-mint-request mint-requests)))
+        (ok results)
+    )
 )
 
-;; Helper function for batch minting
+
+
+;; Helper function for batch minting - FIXED: Better error propagation
 (define-private (batch-mint-helper 
     (request {
         recipient: principal,
@@ -203,13 +308,13 @@
     )
 )
 
-;; Approval Functions
+;; Approval Functions - FIXED: Simplified and corrected
 
 ;; Approve specific token for transfer
 (define-public (approve (spender principal) (token-id uint))
-    (let ((owner (unwrap! (map-get? token-owner token-id) ERR_TOKEN_NOT_FOUND)))
+    (let ((owner (unwrap! (nft-get-owner? ip-nft token-id) ERR_TOKEN_NOT_FOUND)))
         (asserts! (is-eq tx-sender owner) ERR_NOT_TOKEN_OWNER)
-        (map-set token-approvals {owner: owner, spender: spender, token-id: token-id} true)
+        (map-set token-approvals token-id spender)
         (print {type: "approve", owner: owner, spender: spender, token-id: token-id})
         (ok true)
     )
@@ -224,16 +329,14 @@
     )
 )
 
-;; Check if spender is approved for token
+;; Check if spender is approved for all tokens
 (define-read-only (is-approved-for-all (owner principal) (operator principal))
     (default-to false (map-get? operator-approvals {owner: owner, operator: operator}))
 )
 
-;; Get approved spender for token
+;; Get approved spender for token - FIXED: Simplified
 (define-read-only (get-approved (token-id uint))
-    (map-get? token-approvals {owner: (unwrap! (map-get? token-owner token-id) ERR_TOKEN_NOT_FOUND), 
-                              spender: tx-sender, 
-                              token-id: token-id})
+    (ok (map-get? token-approvals token-id))
 )
 
 ;; Read-only Functions
@@ -253,30 +356,9 @@
     (map-get? author-stats author)
 )
 
-;; Search functions
-(define-read-only (get-tokens-by-author (author principal))
-    ;; This would require additional mapping in a production system
-    ;; For now, returns author stats as a reference
-    (map-get? author-stats author)
-)
-
-;; Verify IP ownership
+;; Verify IP ownership - FIXED: Use built-in NFT function
 (define-read-only (verify-ip-ownership (token-id uint) (claimed-owner principal))
-    (match (map-get? token-owner token-id)
-        owner (is-eq owner claimed-owner)
-        false
-    )
-)
-
-;; Administrative Functions
-
-;; Update contract URI (only owner)
-(define-public (set-contract-uri (new-uri (string-utf8 256)))
-    (begin
-        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
-        (var-set contract-uri new-uri)
-        (ok true)
-    )
+    (is-eq (some claimed-owner) (nft-get-owner? ip-nft token-id))
 )
 
 ;; Get contract info
@@ -291,22 +373,32 @@
     }
 )
 
-;; Utility Functions
-
-;; Convert uint to ASCII string (helper for URI generation)
-(define-read-only (uint-to-ascii (value uint))
-    (if (is-eq value u0)
-        "0"
-        (uint-to-ascii-helper value "")
-    )
+;; Recommended: Use built-in int-to-ascii
+(define-read-only (uint-to-string (value uint))
+    (int-to-ascii (to-int value))
 )
 
-(define-private (uint-to-ascii-helper (value uint) (result (string-ascii 10)))
-    (if (is-eq value u0)
-        result
-        (uint-to-ascii-helper 
-            (/ value u10) 
-            (unwrap-panic (as-max-len? (concat (unwrap-panic (element-at "0123456789" (mod value u10))) result) u10))
+;; Remove the problematic uint-to-ascii-custom function entirely
+;; and update get-token-uri to use the built-in approach:
+
+
+;; Burn function - ADDED: Allow burning of NFTs
+(define-public (burn (token-id uint))
+    (let ((owner (unwrap! (nft-get-owner? ip-nft token-id) ERR_TOKEN_NOT_FOUND)))
+        (asserts! (is-eq tx-sender owner) ERR_NOT_TOKEN_OWNER)
+        (match (nft-burn? ip-nft token-id owner)
+            success (begin
+                ;; Clean up mappings
+                (match (get-ip-metadata token-id)
+                    metadata (map-delete hash-to-token (get abstract-hash metadata))
+                    true
+                )
+                (map-delete ip-metadata token-id)
+                (map-delete token-approvals token-id)
+                (print {type: "burn", token-id: token-id, owner: owner})
+                (ok true)
+            )
+            error ERR_TRANSFER_FAILED
         )
     )
 )
